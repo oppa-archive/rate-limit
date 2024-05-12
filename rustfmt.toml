@@ -1,0 +1,4 @@
+edition = "2021"
+use_try_shorthand = true
+remove_nested_parens = true
+use_field_init_shorthand = true
