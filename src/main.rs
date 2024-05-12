@@ -2,7 +2,8 @@ use std::{
     collections::HashMap,
     fmt::{self, Display, Formatter},
     net::SocketAddr,
-    sync::Mutex,
+    sync::{Arc, Mutex},
+    time::Duration,
 };
 
 use axum::{
@@ -13,8 +14,10 @@ use axum::{
     routing::{get, post},
     Router,
 };
+use chrono::DateTime;
 use lazy_static::lazy_static;
 use serde::{Deserialize, Serialize};
+use tokio::time::interval;
 
 const DEFAULT_LIMIT: u32 = 50;
 const DEFAULT_REMAINING: u32 = 50;
@@ -72,8 +75,10 @@ impl Display for RateLimit {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         write!(
             f,
-            "RateLimit {{ ip_address: {}, limit: {}, remaining: {}, issued_at: {}, retry_after: {} }}",
-            self.ip_address, self.limit, self.remaining, self.issued_at, self.retry_after
+            "RateLimit {{ ip_address: {}, limit: {}, remaining: {}, issued_at: {}, expires_at: {} }}",
+            self.ip_address, self.limit, self.remaining,
+            DateTime::from_timestamp(self.issued_at as i64, 0).expect("Failed to convert timestamp to DateTime").to_rfc3339(),
+            DateTime::from_timestamp(self.issued_at as i64 + self.retry_after as i64, 0).expect("Failed to convert timestamp to DateTime").to_rfc3339()
         )
     }
 }
@@ -140,10 +145,28 @@ impl RateLimit {
 
 // RateLimitStore is a hashmap that stores the rate limit data for each ip address.
 // The key is the ip address and the value is the RateLimit struct.
-type RateLimitStore = Mutex<HashMap<String, RateLimit>>;
+type RateLimitStore = Arc<Mutex<HashMap<String, RateLimit>>>;
 
 lazy_static! {
-    static ref RATE_LIMIT_STORE: RateLimitStore = Mutex::new(HashMap::new());
+    static ref RATE_LIMIT_STORE: RateLimitStore = Arc::new(Mutex::new(HashMap::new()));
+}
+
+// reset_rate_limits_task is a background task that runs every 60 seconds and resets the rate limits.
+async fn reset_rate_limits_task() {
+    // TODO: set interval via configuration
+    let mut interval = interval(Duration::from_secs(60));
+
+    loop {
+        interval.tick().await;
+
+        // Reset expired rate limits
+        let mut rate_limit_store = RATE_LIMIT_STORE.lock().unwrap();
+        for rate_limit in rate_limit_store.values_mut() {
+            println!("checking - {}", rate_limit);
+
+            rate_limit.reset_if_expired();
+        }
+    }
 }
 
 // handle_rate_limit is a handler that takes the request ip address and lookup up the rate-limit hashmap
@@ -196,6 +219,9 @@ async fn root() -> &'static str {
 async fn main() {
     // initialize tracing
     tracing_subscriber::fmt::init();
+
+    // Start background task for rate limit resetting
+    tokio::spawn(reset_rate_limits_task());
 
     // build our application with a route
     let app = Router::new()
