@@ -23,7 +23,9 @@ const DEFAULT_LIMIT: u32 = 50;
 const DEFAULT_REMAINING: u32 = 50;
 const DEFAULT_RETRY_AFTER: u64 = 300;
 
+/// RateLimitError is an enum that represents the rate limit errors.
 enum RateLimitError {
+    /// RateLimitExceeded is an error that is returned when the rate limit is exceeded.
     RateLimitExceeded,
 }
 
@@ -57,17 +59,17 @@ fn current_timestamp() -> u64 {
         .as_secs()
 }
 
-// RateLimit is a struct that holds the rate limit data for a given ip address.
+/// RateLimit is a struct that holds the rate limit data for a given ip address.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct RateLimit {
     ip_address: String,
-    // limit is the maximum request that can be made in a given time frame.
+    /// limit is the maximum request that can be made in a given time frame.
     limit: u32,
-    // remaining is the number of requests that can be made before the rate limit is hit.
+    /// remaining is the number of requests that can be made before the rate limit is hit.
     remaining: u32,
-    // reset is a unix timestamp of the time the rate limit was last reset.
+    /// reset is a unix timestamp of the time the rate limit was last reset.
     issued_at: u64,
-    // retry_after is the number of seconds until the rate limit resets, it's a TTL.
+    /// retry_after is the number of seconds until the rate limit resets, it's a TTL.
     retry_after: u64,
 }
 
@@ -105,8 +107,8 @@ impl IntoResponse for RateLimit {
 }
 
 impl RateLimit {
-    // new is a constructor for the RateLimit struct.
-    // It takes an ip address and returns a new RateLimit struct with the default values.
+    /// new is a constructor for the RateLimit struct.
+    /// It takes an ip address and returns a new RateLimit struct with the default values.
     fn new(ip_address: String) -> RateLimit {
         RateLimit {
             ip_address,
@@ -117,8 +119,8 @@ impl RateLimit {
         }
     }
 
-    // is_expired is a method that checks if the rate limit data is expired.
-    // It returns true if the rate limit data is expired and false if it's not.
+    /// is_expired is a method that checks if the rate limit data is expired.
+    /// It returns true if the rate limit data is expired and false if it's not.
     fn is_expired(&self) -> bool {
         current_timestamp() > self.issued_at + self.retry_after
     }
@@ -143,23 +145,21 @@ impl RateLimit {
     }
 }
 
-// RateLimitStore is a hashmap that stores the rate limit data for each ip address.
-// The key is the ip address and the value is the RateLimit struct.
+/// RateLimitStore is a hashmap that stores the rate limit data for each ip address.
+/// The key is the ip address and the value is the RateLimit struct.
 type RateLimitStore = Arc<Mutex<HashMap<String, RateLimit>>>;
 
 lazy_static! {
     static ref RATE_LIMIT_STORE: RateLimitStore = Arc::new(Mutex::new(HashMap::new()));
 }
 
-// reset_rate_limits_task is a background task that runs every 60 seconds and resets the rate limits.
+/// reset_rate_limits_task is a background task that runs every 60 seconds and resets the rate limits.
 async fn reset_rate_limits_task() {
-    // TODO: set interval via configuration
     let mut interval = interval(Duration::from_secs(60));
 
     loop {
         interval.tick().await;
 
-        // Reset expired rate limits
         let mut rate_limit_store = RATE_LIMIT_STORE.lock().unwrap();
         for rate_limit in rate_limit_store.values_mut() {
             println!("checking - {}", rate_limit);
@@ -169,8 +169,8 @@ async fn reset_rate_limits_task() {
     }
 }
 
-// handle_rate_limit is a handler that takes the request ip address and lookup up the rate-limit hashmap
-// finds the rate-limit for the ip address and returns the rate limit data.
+/// handle_rate_limit is a handler that takes the request ip address and lookup up the rate-limit hashmap
+/// finds the rate-limit for the ip address and returns the rate limit data.
 async fn handle_request(InsecureClientIp(ip): InsecureClientIp) -> Response<Body> {
     let ip_address = ip.to_string();
     let mut rate_limit_store = RATE_LIMIT_STORE.lock().unwrap();
@@ -195,8 +195,8 @@ async fn handle_request(InsecureClientIp(ip): InsecureClientIp) -> Response<Body
     }
 }
 
-// handle_status is a handler that takes the request ip address and lookup up the rate-limit hashmap
-// finds the rate-limit for the ip address and returns the rate limit data.
+/// handle_status is a handler that takes the request ip address and lookup up the rate-limit hashmap
+/// finds the rate-limit for the ip address and returns the rate limit data.
 async fn handle_status(InsecureClientIp(ip): InsecureClientIp) -> Response<Body> {
     let ip_address = ip.to_string();
     let mut rate_limit_store = RATE_LIMIT_STORE.lock().unwrap();
@@ -210,20 +210,17 @@ async fn handle_status(InsecureClientIp(ip): InsecureClientIp) -> Response<Body>
     rate_limit.clone().into_response()
 }
 
-// basic handler that responds with a static string
+/// basic handler that responds with a static string
 async fn root(insecure_ip: InsecureClientIp, secure_ip: SecureClientIp) -> String {
     format!("ping! - {insecure_ip:?} {secure_ip:?}")
 }
 
 #[tokio::main]
 async fn main() {
-    // initialize tracing
     tracing_subscriber::fmt::init();
 
-    // Start background task for rate limit resetting
     tokio::spawn(reset_rate_limits_task());
 
-    // build our application with a route
     let app = Router::new()
         .route("/", get(root))
         .route("/status", get(handle_status))
@@ -233,11 +230,9 @@ async fn main() {
     let addr = SocketAddr::from(([0, 0, 0, 0], 3000));
     println!("Starting server on http://{}", addr);
 
-    // run our app with hyper, listening globally on port 3000
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
     axum::serve(
         listener,
-        // Don't forget to add `ConnectInfo` if you aren't behind a proxy
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
     .await
@@ -264,13 +259,10 @@ mod tests {
     fn test_rate_limit_is_expired() {
         let mut rate_limit = RateLimit::new("127.0.0.1".to_string());
 
-        // Initial rate limit should not be expired
         assert!(!rate_limit.is_expired());
 
-        // Set a custom issued_at time in the past to simulate expiration
         rate_limit.issued_at = current_timestamp() - 400;
 
-        // Rate limit should now be expired
         assert!(rate_limit.is_expired());
     }
 
@@ -278,13 +270,9 @@ mod tests {
     fn test_reset_if_expired() {
         let mut rate_limit = RateLimit::new("127.0.0.1".to_string());
 
-        // Set a custom issued_at time in the past to simulate expiration
         rate_limit.issued_at = current_timestamp() - 400;
-
-        // Reset the rate limit if expired
         rate_limit.reset_if_expired();
 
-        // After reset, the rate limit should have reset values
         assert_eq!(rate_limit.remaining, DEFAULT_LIMIT);
         assert!(!rate_limit.is_expired()); // Should be reset and not expired
     }
@@ -293,12 +281,10 @@ mod tests {
     fn test_consume_request() {
         let mut rate_limit = RateLimit::new("127.0.0.1".to_string());
 
-        // Consume requests until rate limit is exhausted
         for _ in 0..DEFAULT_LIMIT {
             assert!(rate_limit.consume_request());
         }
 
-        // Rate limit should be exhausted now
         assert!(!rate_limit.consume_request());
     }
 }
