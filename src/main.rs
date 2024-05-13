@@ -8,12 +8,12 @@ use std::{
 
 use axum::{
     body::Body,
-    extract::ConnectInfo,
     http::{header, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
     Router,
 };
+use axum_client_ip::{InsecureClientIp, SecureClientIp, SecureClientIpSource};
 use chrono::DateTime;
 use lazy_static::lazy_static;
 use serde::{Deserialize, Serialize};
@@ -171,8 +171,8 @@ async fn reset_rate_limits_task() {
 
 // handle_rate_limit is a handler that takes the request ip address and lookup up the rate-limit hashmap
 // finds the rate-limit for the ip address and returns the rate limit data.
-async fn handle_request(addr: ConnectInfo<SocketAddr>) -> Response<Body> {
-    let ip_address = addr.ip().to_string();
+async fn handle_request(InsecureClientIp(ip): InsecureClientIp) -> Response<Body> {
+    let ip_address = ip.to_string();
     let mut rate_limit_store = RATE_LIMIT_STORE.lock().unwrap();
 
     let rate_limit = rate_limit_store
@@ -197,8 +197,8 @@ async fn handle_request(addr: ConnectInfo<SocketAddr>) -> Response<Body> {
 
 // handle_status is a handler that takes the request ip address and lookup up the rate-limit hashmap
 // finds the rate-limit for the ip address and returns the rate limit data.
-async fn handle_status(addr: ConnectInfo<SocketAddr>) -> Response<Body> {
-    let ip_address = addr.ip().to_string();
+async fn handle_status(InsecureClientIp(ip): InsecureClientIp) -> Response<Body> {
+    let ip_address = ip.to_string();
     let mut rate_limit_store = RATE_LIMIT_STORE.lock().unwrap();
 
     let rate_limit = rate_limit_store
@@ -211,8 +211,8 @@ async fn handle_status(addr: ConnectInfo<SocketAddr>) -> Response<Body> {
 }
 
 // basic handler that responds with a static string
-async fn root() -> &'static str {
-    "ping!"
+async fn root(insecure_ip: InsecureClientIp, secure_ip: SecureClientIp) -> String {
+    format!("ping! - {insecure_ip:?} {secure_ip:?}")
 }
 
 #[tokio::main]
@@ -227,7 +227,8 @@ async fn main() {
     let app = Router::new()
         .route("/", get(root))
         .route("/status", get(handle_status))
-        .route("/request", post(handle_request));
+        .route("/request", post(handle_request))
+        .layer(SecureClientIpSource::ConnectInfo.into_extension());
 
     let addr = SocketAddr::from(([0, 0, 0, 0], 3000));
     println!("Starting server on http://{}", addr);
