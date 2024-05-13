@@ -243,3 +243,62 @@ async fn main() {
     .await
     .unwrap();
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_new_rate_limit() {
+        let ip_address = "127.0.0.1".to_string();
+        let rate_limit = RateLimit::new(ip_address.clone());
+
+        assert_eq!(rate_limit.ip_address, ip_address);
+        assert_eq!(rate_limit.limit, DEFAULT_LIMIT);
+        assert_eq!(rate_limit.remaining, DEFAULT_REMAINING);
+        assert!(rate_limit.issued_at > 0);
+        assert_eq!(rate_limit.retry_after, DEFAULT_RETRY_AFTER);
+    }
+
+    #[test]
+    fn test_rate_limit_is_expired() {
+        let mut rate_limit = RateLimit::new("127.0.0.1".to_string());
+
+        // Initial rate limit should not be expired
+        assert!(!rate_limit.is_expired());
+
+        // Set a custom issued_at time in the past to simulate expiration
+        rate_limit.issued_at = current_timestamp() - 400;
+
+        // Rate limit should now be expired
+        assert!(rate_limit.is_expired());
+    }
+
+    #[test]
+    fn test_reset_if_expired() {
+        let mut rate_limit = RateLimit::new("127.0.0.1".to_string());
+
+        // Set a custom issued_at time in the past to simulate expiration
+        rate_limit.issued_at = current_timestamp() - 400;
+
+        // Reset the rate limit if expired
+        rate_limit.reset_if_expired();
+
+        // After reset, the rate limit should have reset values
+        assert_eq!(rate_limit.remaining, DEFAULT_LIMIT);
+        assert!(!rate_limit.is_expired()); // Should be reset and not expired
+    }
+
+    #[test]
+    fn test_consume_request() {
+        let mut rate_limit = RateLimit::new("127.0.0.1".to_string());
+
+        // Consume requests until rate limit is exhausted
+        for _ in 0..DEFAULT_LIMIT {
+            assert!(rate_limit.consume_request());
+        }
+
+        // Rate limit should be exhausted now
+        assert!(!rate_limit.consume_request());
+    }
+}
