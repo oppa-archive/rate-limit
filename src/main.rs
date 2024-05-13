@@ -52,13 +52,6 @@ impl IntoResponse for RateLimitError {
     }
 }
 
-fn current_timestamp() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs()
-}
-
 /// RateLimit is a struct that holds the rate limit data for a given ip address.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct RateLimit {
@@ -114,7 +107,7 @@ impl RateLimit {
             ip_address,
             limit: DEFAULT_LIMIT,
             remaining: DEFAULT_REMAINING,
-            issued_at: current_timestamp(),
+            issued_at: RateLimit::current_timestamp(),
             retry_after: DEFAULT_RETRY_AFTER,
         }
     }
@@ -122,13 +115,13 @@ impl RateLimit {
     /// is_expired is a method that checks if the rate limit data is expired.
     /// It returns true if the rate limit data is expired and false if it's not.
     fn is_expired(&self) -> bool {
-        current_timestamp() > self.issued_at + self.retry_after
+        RateLimit::current_timestamp() > self.issued_at + self.retry_after
     }
 
     fn reset_if_expired(&mut self) {
         if self.is_expired() {
             self.remaining = self.limit;
-            self.issued_at = current_timestamp();
+            self.issued_at = RateLimit::current_timestamp();
             self.retry_after = DEFAULT_RETRY_AFTER;
         }
     }
@@ -143,6 +136,14 @@ impl RateLimit {
             false
         }
     }
+
+    /// current_timestamp is a helper function that returns the current unix timestamp.
+    pub fn current_timestamp() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    }
 }
 
 /// RateLimitStore is a hashmap that stores the rate limit data for each ip address.
@@ -150,6 +151,7 @@ impl RateLimit {
 type RateLimitStore = Arc<Mutex<HashMap<String, RateLimit>>>;
 
 lazy_static! {
+    /// RATE_LIMIT_STORE is a global hashmap that stores the rate limit data for each ip address.
     static ref RATE_LIMIT_STORE: RateLimitStore = Arc::new(Mutex::new(HashMap::new()));
 }
 
@@ -261,7 +263,7 @@ mod tests {
 
         assert!(!rate_limit.is_expired());
 
-        rate_limit.issued_at = current_timestamp() - 400;
+        rate_limit.issued_at = RateLimit::current_timestamp() - 400;
 
         assert!(rate_limit.is_expired());
     }
@@ -270,7 +272,7 @@ mod tests {
     fn test_reset_if_expired() {
         let mut rate_limit = RateLimit::new("127.0.0.1".to_string());
 
-        rate_limit.issued_at = current_timestamp() - 400;
+        rate_limit.issued_at = RateLimit::current_timestamp() - 400;
         rate_limit.reset_if_expired();
 
         assert_eq!(rate_limit.remaining, DEFAULT_LIMIT);
