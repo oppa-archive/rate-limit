@@ -1,6 +1,6 @@
 use std::{
     collections::HashMap,
-    fmt::{self, Display, Formatter},
+    fmt::{Display, Formatter, Result},
     net::SocketAddr,
     sync::{Arc, Mutex},
     time::Duration,
@@ -19,9 +19,12 @@ use lazy_static::lazy_static;
 use serde::{Deserialize, Serialize};
 use tokio::time::interval;
 
-const DEFAULT_LIMIT: u32 = 50;
-const DEFAULT_REMAINING: u32 = 50;
-const DEFAULT_RETRY_AFTER: u64 = 300;
+const DEFAULT_LIMIT: u32 = 50; // 100;
+const DEFAULT_RETRY_AFTER: u64 = 300; // 120;
+const DEFAULT_MAX_RETRY_COUNT: u32 = 5;
+const DEFAULT_MAX_RETRY_AFTER: u64 = 3600; // 1800;
+const DEFAULT_RESET_TASK_INTERVAL: u64 = 60;
+const DEFAULT_EXPONENTIAL_BACKOFF_FACTOR: f64 = 1.5; // 2.0;
 
 /// RateLimitError is an enum that represents the rate limit errors.
 enum RateLimitError {
@@ -64,16 +67,20 @@ struct RateLimit {
     issued_at: u64,
     /// retry_after is the number of seconds until the rate limit resets, it's a TTL.
     retry_after: u64,
+    /// retry_count is the number of times the rate limit has been hit.
+    retry_count: u32,
 }
 
 impl Display for RateLimit {
-    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut Formatter) -> Result {
         write!(
             f,
             "RateLimit {{ ip_address: {}, limit: {}, remaining: {}, issued_at: {}, expires_at: {} }}",
-            self.ip_address, self.limit, self.remaining,
+            self.ip_address,
+            self.limit,
+            self.remaining,
             DateTime::from_timestamp(self.issued_at as i64, 0).expect("Failed to convert timestamp to DateTime").to_rfc3339(),
-            DateTime::from_timestamp(self.issued_at as i64 + self.retry_after as i64, 0).expect("Failed to convert timestamp to DateTime").to_rfc3339()
+            DateTime::from_timestamp(self.issued_at as i64 + self.retry_after as i64, 0).expect("Failed to convert timestamp to DateTime").to_rfc3339(),
         )
     }
 }
@@ -106,9 +113,10 @@ impl RateLimit {
         RateLimit {
             ip_address,
             limit: DEFAULT_LIMIT,
-            remaining: DEFAULT_REMAINING,
+            remaining: DEFAULT_LIMIT,
             issued_at: RateLimit::current_timestamp(),
             retry_after: DEFAULT_RETRY_AFTER,
+            retry_count: 0,
         }
     }
 
@@ -118,14 +126,17 @@ impl RateLimit {
         RateLimit::current_timestamp() > self.issued_at + self.retry_after
     }
 
+    /// reset_if_expired is a method that resets the rate limit data if it's expired.
     fn reset_if_expired(&mut self) {
         if self.is_expired() {
             self.remaining = self.limit;
             self.issued_at = RateLimit::current_timestamp();
             self.retry_after = DEFAULT_RETRY_AFTER;
+            self.retry_count = 0;
         }
     }
 
+    /// consume_request is a method that consumes a request from the rate limit.
     fn consume_request(&mut self) -> bool {
         self.reset_if_expired();
 
@@ -133,16 +144,45 @@ impl RateLimit {
             self.remaining -= 1;
             true
         } else {
+            // Max retry count reached, gracefully degrade
+            if self.retry_count < DEFAULT_MAX_RETRY_COUNT {
+                self.retry_count += 1;
+            }
+            // Apply exponential backoff: double the retry interval
+            if self.retry_count == DEFAULT_MAX_RETRY_COUNT
+                && self.retry_after < DEFAULT_MAX_RETRY_AFTER
+            {
+                self.retry_after =
+                    (self.retry_after as f64 * DEFAULT_EXPONENTIAL_BACKOFF_FACTOR) as u64;
+            }
+
             false
         }
     }
 
     /// current_timestamp is a helper function that returns the current unix timestamp.
-    pub fn current_timestamp() -> u64 {
+    fn current_timestamp() -> u64 {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs()
+    }
+
+    /// reset_rate_limits_task is a background task that runs every DEFAULT_RESET_TASK_INTERVAL
+    /// seconds and resets the rate limits.
+    async fn reset_rate_limits_task() {
+        let mut interval = interval(Duration::from_secs(DEFAULT_RESET_TASK_INTERVAL));
+
+        loop {
+            interval.tick().await;
+
+            let mut rate_limit_store = RATE_LIMIT_STORE.lock().unwrap();
+            for rate_limit in rate_limit_store.values_mut() {
+                println!("checking - {:?}", rate_limit);
+
+                rate_limit.reset_if_expired();
+            }
+        }
     }
 }
 
@@ -155,22 +195,6 @@ lazy_static! {
     static ref RATE_LIMIT_STORE: RateLimitStore = Arc::new(Mutex::new(HashMap::new()));
 }
 
-/// reset_rate_limits_task is a background task that runs every 60 seconds and resets the rate limits.
-async fn reset_rate_limits_task() {
-    let mut interval = interval(Duration::from_secs(60));
-
-    loop {
-        interval.tick().await;
-
-        let mut rate_limit_store = RATE_LIMIT_STORE.lock().unwrap();
-        for rate_limit in rate_limit_store.values_mut() {
-            println!("checking - {}", rate_limit);
-
-            rate_limit.reset_if_expired();
-        }
-    }
-}
-
 /// handle_rate_limit is a handler that takes the request ip address and lookup up the rate-limit hashmap
 /// finds the rate-limit for the ip address and returns the rate limit data.
 async fn handle_request(InsecureClientIp(ip): InsecureClientIp) -> Response<Body> {
@@ -178,8 +202,8 @@ async fn handle_request(InsecureClientIp(ip): InsecureClientIp) -> Response<Body
     let mut rate_limit_store = RATE_LIMIT_STORE.lock().unwrap();
 
     let rate_limit = rate_limit_store
-        .entry(ip_address.to_string())
-        .or_insert_with(|| RateLimit::new(ip_address));
+        .entry(ip_address.clone())
+        .or_insert_with(|| RateLimit::new(ip_address.clone()));
 
     if rate_limit.consume_request() {
         println!("{}", rate_limit);
@@ -204,15 +228,15 @@ async fn handle_status(InsecureClientIp(ip): InsecureClientIp) -> Response<Body>
     let mut rate_limit_store = RATE_LIMIT_STORE.lock().unwrap();
 
     let rate_limit = rate_limit_store
-        .entry(ip_address.to_string())
-        .or_insert_with(|| RateLimit::new(ip_address));
+        .entry(ip_address.clone())
+        .or_insert_with(|| RateLimit::new(ip_address.clone()));
 
     println!("{}", rate_limit);
 
     rate_limit.clone().into_response()
 }
 
-/// basic handler that responds with a static string
+/// root is a handler that takes the request ip address and returns a string response.
 async fn root(insecure_ip: InsecureClientIp, secure_ip: SecureClientIp) -> String {
     format!("ping! - {insecure_ip:?} {secure_ip:?}")
 }
@@ -221,7 +245,7 @@ async fn root(insecure_ip: InsecureClientIp, secure_ip: SecureClientIp) -> Strin
 async fn main() {
     tracing_subscriber::fmt::init();
 
-    tokio::spawn(reset_rate_limits_task());
+    tokio::spawn(RateLimit::reset_rate_limits_task());
 
     let app = Router::new()
         .route("/", get(root))
@@ -252,7 +276,7 @@ mod tests {
 
         assert_eq!(rate_limit.ip_address, ip_address);
         assert_eq!(rate_limit.limit, DEFAULT_LIMIT);
-        assert_eq!(rate_limit.remaining, DEFAULT_REMAINING);
+        assert_eq!(rate_limit.remaining, DEFAULT_LIMIT);
         assert!(rate_limit.issued_at > 0);
         assert_eq!(rate_limit.retry_after, DEFAULT_RETRY_AFTER);
     }
@@ -276,7 +300,7 @@ mod tests {
         rate_limit.reset_if_expired();
 
         assert_eq!(rate_limit.remaining, DEFAULT_LIMIT);
-        assert!(!rate_limit.is_expired()); // Should be reset and not expired
+        assert!(!rate_limit.is_expired());
     }
 
     #[test]
