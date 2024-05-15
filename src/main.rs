@@ -19,49 +19,13 @@ use lazy_static::lazy_static;
 use serde::{Deserialize, Serialize};
 use tokio::time::interval;
 
-/// rtconfig is a module that holds the rate limit configuration.
-mod rtconfig {
-    /// DEFAULT_LIMIT is the default rate limit.
-    pub const DEFAULT_LIMIT: u32 = 50; // 100;
-    /// DEFAULT_RETRY_AFTER is the default retry after time in seconds.
-    pub const DEFAULT_RETRY_AFTER: u64 = 300; // 120;
-    /// DEFAULT_MAX_RETRY_COUNT is the default max retry count.
-    pub const DEFAULT_MAX_RETRY_COUNT: u32 = 5;
-    /// DEFAULT_MAX_RETRY_AFTER is the default max retry after time in seconds.
-    pub const DEFAULT_MAX_RETRY_AFTER: u64 = 3600; // 1800;
-    /// DEFAULT_RESET_TASK_INTERVAL is the default rate limit reset task interval in seconds.
-    pub const DEFAULT_RESET_TASK_INTERVAL: u64 = 60;
-    /// DEFAULT_EXPONENTIAL_BACKOFF_FACTOR is the default exponential backoff factor.
-    pub const DEFAULT_EXPONENTIAL_BACKOFF_FACTOR: f64 = 1.5; // 2.0;
-}
+mod config;
+pub use self::config::Config;
 
 /// RateLimitError is an enum that represents the rate limit errors.
 enum RateLimitError {
     /// RateLimitExceeded is an error that is returned when the rate limit is exceeded.
     RateLimitExceeded,
-}
-
-impl IntoResponse for RateLimitError {
-    fn into_response(self) -> Response {
-        let response = match self {
-            RateLimitError::RateLimitExceeded => {
-                let mut response = Response::new(Body::from("Rate limit exceeded"));
-
-                *response.status_mut() = StatusCode::TOO_MANY_REQUESTS;
-                response.headers_mut().insert(
-                    header::RETRY_AFTER,
-                    HeaderValue::from_str(&rtconfig::DEFAULT_RETRY_AFTER.to_string()).unwrap(),
-                );
-                response
-                    .headers_mut()
-                    .insert(header::CONTENT_TYPE, HeaderValue::from_static("text/plain"));
-
-                response
-            }
-        };
-
-        response
-    }
 }
 
 /// RateLimit is a struct that holds the rate limit data for a given ip address.
@@ -78,6 +42,41 @@ struct RateLimit {
     retry_after: u64,
     /// retry_count is the number of times the rate limit has been hit.
     retry_count: u32,
+}
+
+/// RateLimitStore is a hashmap that stores the rate limit data for each ip address.
+/// The key is the ip address and the value is the RateLimit struct.
+type RateLimitStore = Arc<Mutex<HashMap<String, RateLimit>>>;
+
+lazy_static! {
+    /// RATE_LIMIT_STORE is a global hashmap that stores the rate limit data for each ip address.
+    static ref RATE_LIMIT_STORE: RateLimitStore = Arc::new(Mutex::new(HashMap::new()));
+  /// CONFIG is a global configuration struct that holds the configuration values.
+    static ref CONFIG: Config = Config::from_env();
+
+}
+
+impl IntoResponse for RateLimitError {
+    fn into_response(self) -> Response {
+        let response = match self {
+            RateLimitError::RateLimitExceeded => {
+                let mut response = Response::new(Body::from("Rate limit exceeded"));
+
+                *response.status_mut() = StatusCode::TOO_MANY_REQUESTS;
+                response.headers_mut().insert(
+                    header::RETRY_AFTER,
+                    HeaderValue::from_str(&CONFIG.retry_after.clone().to_string()).unwrap(),
+                );
+                response
+                    .headers_mut()
+                    .insert(header::CONTENT_TYPE, HeaderValue::from_static("text/plain"));
+
+                response
+            }
+        };
+
+        response
+    }
 }
 
 impl Display for RateLimit {
@@ -121,10 +120,10 @@ impl RateLimit {
     fn new(ip_address: String) -> RateLimit {
         RateLimit {
             ip_address,
-            limit: rtconfig::DEFAULT_LIMIT,
-            remaining: rtconfig::DEFAULT_LIMIT,
+            limit: CONFIG.max_request_limit_per_ip,
+            remaining: CONFIG.max_request_limit_per_ip,
             issued_at: RateLimit::current_timestamp(),
-            retry_after: rtconfig::DEFAULT_RETRY_AFTER,
+            retry_after: CONFIG.retry_after,
             retry_count: 0,
         }
     }
@@ -140,7 +139,7 @@ impl RateLimit {
         if self.is_expired() {
             self.remaining = self.limit;
             self.issued_at = RateLimit::current_timestamp();
-            self.retry_after = rtconfig::DEFAULT_RETRY_AFTER;
+            self.retry_after = CONFIG.retry_after;
             self.retry_count = 0;
         }
     }
@@ -153,16 +152,19 @@ impl RateLimit {
             self.remaining -= 1;
             true
         } else {
-            // Max retry count reached, gracefully degrade
-            if self.retry_count < rtconfig::DEFAULT_MAX_RETRY_COUNT {
-                self.retry_count += 1;
-            }
             // Apply exponential backoff: double the retry interval
-            if self.retry_count == rtconfig::DEFAULT_MAX_RETRY_COUNT
-                && self.retry_after < rtconfig::DEFAULT_MAX_RETRY_AFTER
+            if self.retry_count == CONFIG.max_graceful_degradation_requests
+                && self.retry_after < CONFIG.max_retry_after
             {
-                self.retry_after =
-                    (self.retry_after as f64 * rtconfig::DEFAULT_EXPONENTIAL_BACKOFF_FACTOR) as u64;
+                self.retry_after = (self.retry_after as f64 * CONFIG.exponential_backoff) as u64;
+                // Cap the retry interval
+                if self.retry_after > CONFIG.max_retry_after {
+                    self.retry_after = CONFIG.max_retry_after;
+                }
+            }
+            // Max retry count reached, gracefully degrade
+            if self.retry_count < CONFIG.max_graceful_degradation_requests {
+                self.retry_count += 1;
             }
 
             false
@@ -180,7 +182,7 @@ impl RateLimit {
     /// reset_rate_limits_task is a background task that runs every DEFAULT_RESET_TASK_INTERVAL
     /// seconds and resets the rate limits.
     async fn reset_rate_limits_task() {
-        let mut interval = interval(Duration::from_secs(rtconfig::DEFAULT_RESET_TASK_INTERVAL));
+        let mut interval = interval(Duration::from_secs(CONFIG.reset_interval));
 
         loop {
             interval.tick().await;
@@ -193,15 +195,6 @@ impl RateLimit {
             }
         }
     }
-}
-
-/// RateLimitStore is a hashmap that stores the rate limit data for each ip address.
-/// The key is the ip address and the value is the RateLimit struct.
-type RateLimitStore = Arc<Mutex<HashMap<String, RateLimit>>>;
-
-lazy_static! {
-    /// RATE_LIMIT_STORE is a global hashmap that stores the rate limit data for each ip address.
-    static ref RATE_LIMIT_STORE: RateLimitStore = Arc::new(Mutex::new(HashMap::new()));
 }
 
 /// handle_rate_limit is a handler that takes the request ip address and lookup up the rate-limit hashmap
@@ -262,7 +255,7 @@ async fn main() {
         .route("/request", post(handle_request))
         .layer(SecureClientIpSource::ConnectInfo.into_extension());
 
-    let addr = SocketAddr::from(([0, 0, 0, 0], 3000));
+    let addr = SocketAddr::from(([0, 0, 0, 0], CONFIG.port));
     println!("Starting server on http://{}", addr);
 
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
@@ -284,10 +277,13 @@ mod tests {
         let rate_limit = RateLimit::new(ip_address.clone());
 
         assert_eq!(rate_limit.ip_address, ip_address);
-        assert_eq!(rate_limit.limit, rtconfig::DEFAULT_LIMIT);
-        assert_eq!(rate_limit.remaining, rtconfig::DEFAULT_LIMIT);
+        assert_eq!(rate_limit.limit, CONFIG.max_request_limit_per_ip.clone());
+        assert_eq!(
+            rate_limit.remaining,
+            CONFIG.max_request_limit_per_ip.clone()
+        );
         assert!(rate_limit.issued_at > 0);
-        assert_eq!(rate_limit.retry_after, rtconfig::DEFAULT_RETRY_AFTER);
+        assert_eq!(rate_limit.retry_after, CONFIG.retry_after.clone())
     }
 
     #[test]
@@ -308,7 +304,7 @@ mod tests {
         rate_limit.issued_at = RateLimit::current_timestamp() - 400;
         rate_limit.reset_if_expired();
 
-        assert_eq!(rate_limit.remaining, rtconfig::DEFAULT_LIMIT);
+        assert_eq!(rate_limit.remaining, CONFIG.max_request_limit_per_ip);
         assert!(!rate_limit.is_expired());
     }
 
@@ -316,7 +312,7 @@ mod tests {
     fn test_consume_request() {
         let mut rate_limit = RateLimit::new("127.0.0.1".to_string());
 
-        for _ in 0..rtconfig::DEFAULT_LIMIT {
+        for _ in 0..CONFIG.max_request_limit_per_ip {
             assert!(rate_limit.consume_request());
         }
 
