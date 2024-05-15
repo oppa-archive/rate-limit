@@ -23,3 +23,13 @@ Implement a rate limiting service that can be used to limit the number of reques
 - `/status`: Returns the number of requests remaining for the client within the time window.
 
 - `/request`: Emulates a request to the API. Each request should decrement the number of requests remaining for the client within the time window. If the number of requests remaining is zero, the request should be rejected with 429, To Many Requests response. The response should include the number of seconds until the client can make another request. Respond with 200, OK if the request is accepted.
+
+### Usage
+
+```sh
+TARGET=rate_limit make dev
+```
+
+```sh
+make test
+```
