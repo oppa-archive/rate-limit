@@ -1,7 +1,8 @@
 use std::{
     collections::HashMap,
-    fmt::{Display, Formatter, Result},
+    future::Future,
     net::SocketAddr,
+    pin::Pin,
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -15,6 +16,8 @@ use axum::{
 };
 use axum_client_ip::{InsecureClientIp, SecureClientIp, SecureClientIpSource};
 use chrono::DateTime;
+use hyper::server::conn::http1;
+use hyper_util::rt::{TokioIo, TokioTimer};
 use lazy_static::lazy_static;
 use serde::{Deserialize, Serialize};
 use tokio::time::interval;
@@ -51,7 +54,7 @@ type RateLimitStore = Arc<Mutex<HashMap<String, RateLimit>>>;
 lazy_static! {
     /// RATE_LIMIT_STORE is a global hashmap that stores the rate limit data for each ip address.
     static ref RATE_LIMIT_STORE: RateLimitStore = Arc::new(Mutex::new(HashMap::new()));
-  /// CONFIG is a global configuration struct that holds the configuration values.
+    /// CONFIG is a global configuration struct that holds the configuration values.
     static ref CONFIG: Config = Config::from_env();
 
 }
@@ -79,8 +82,8 @@ impl IntoResponse for RateLimitError {
     }
 }
 
-impl Display for RateLimit {
-    fn fmt(&self, f: &mut Formatter) -> Result {
+impl std::fmt::Display for RateLimit {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         write!(
             f,
             "RateLimit {{ ip_address: {}, limit: {}, remaining: {}, issued_at: {}, expires_at: {} }}",
@@ -210,7 +213,7 @@ async fn handle_request(InsecureClientIp(ip): InsecureClientIp) -> Response<Body
     if rate_limit.consume_request() {
         println!("{}", rate_limit);
 
-        let mut response = Response::new(Body::from("OK"));
+        let mut response = axum::response::Response::new(Body::from("OK"));
 
         *response.status_mut() = StatusCode::OK;
         response
@@ -225,7 +228,7 @@ async fn handle_request(InsecureClientIp(ip): InsecureClientIp) -> Response<Body
 
 /// handle_status is a handler that takes the request ip address and lookup up the rate-limit hashmap
 /// finds the rate-limit for the ip address and returns the rate limit data.
-async fn handle_status(InsecureClientIp(ip): InsecureClientIp) -> Response<Body> {
+async fn handle_status(InsecureClientIp(ip): InsecureClientIp) -> axum::response::Response<Body> {
     let ip_address = ip.to_string();
     let mut rate_limit_store = RATE_LIMIT_STORE.lock().unwrap();
 
@@ -243,28 +246,86 @@ async fn root(insecure_ip: InsecureClientIp, secure_ip: SecureClientIp) -> Strin
     format!("ping! - {insecure_ip:?} {secure_ip:?}")
 }
 
+#[derive(Debug, Clone)]
+struct Svc {}
+
+impl hyper::service::Service<::hyper::Request<hyper::body::Incoming>> for Svc {
+    type Response = hyper::Response<Body>;
+    type Error = hyper::Error;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    fn call(&self, req: hyper::Request<hyper::body::Incoming>) -> Self::Future {
+        // Box::pin(async {})
+
+        // let addr = SocketAddr::from(([0, 0, 0, 0], CONFIG.port));
+        // println!("Listening on http://{}", addr);
+
+        // let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
+        // axum::serve(
+        //     listener,
+        //     app.into_make_service_with_connect_info::<SocketAddr>(),
+        // )
+        // .await
+        // .unwrap();
+
+        let response = hyper::Response::new(Body::from("Hello, World!"));
+        Box::pin(async { Ok(response) })
+
+        // let app = Router::new()
+        //     .route("/", get(root))
+        //     .route("/status", get(handle_status))
+        //     .route("/request", post(handle_request))
+        //     .layer(SecureClientIpSource::ConnectInfo.into_extension());
+
+        // app.into_make_service_with_connect_info::<SocketAddr>();
+        // app.as_service();
+
+        // Box::pin(async { Ok(app) })
+        // Box::pin(app)
+    }
+}
+
 #[tokio::main]
-async fn main() {
+async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     tracing_subscriber::fmt::init();
 
-    tokio::spawn(RateLimit::reset_rate_limits_task());
-
-    let app = Router::new()
-        .route("/", get(root))
-        .route("/status", get(handle_status))
-        .route("/request", post(handle_request))
-        .layer(SecureClientIpSource::ConnectInfo.into_extension());
+    // tokio::spawn(RateLimit::reset_rate_limits_task());
 
     let addr = SocketAddr::from(([0, 0, 0, 0], CONFIG.port));
-    println!("Starting server on http://{}", addr);
-
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .await
-    .unwrap();
+
+    println!("Listening on http://{}", addr);
+
+    // let app = Router::new()
+    //     .route("/", get(root))
+    //     .route("/status", get(handle_status))
+    //     .route("/request", post(handle_request))
+    //     .layer(SecureClientIpSource::ConnectInfo.into_extension());
+
+    // let addr = SocketAddr::from(([0, 0, 0, 0], CONFIG.port));
+    // println!("Listening on http://{}", addr);
+
+    // let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
+    // axum::serve(
+    //     listener,
+    //     app.into_make_service_with_connect_info::<SocketAddr>(),
+    // )
+    // .await
+    // .unwrap();
+
+    let svc = Svc {};
+
+    loop {
+        let (stream, _) = listener.accept().await.unwrap();
+        let io = TokioIo::new(stream);
+        let svc_clone = svc.clone();
+
+        tokio::task::spawn(async move {
+            if let Err(err) = http1::Builder::new().serve_connection(io, svc_clone).await {
+                eprintln!("an error occurred; error = {:?}", err);
+            }
+        });
+    }
 }
 
 #[cfg(test)]
